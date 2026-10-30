@@ -45,6 +45,13 @@ h1,h2,h3,h4{margin:0;font-weight:700;letter-spacing:-.01em}
   border-radius:12px;padding:10px 13px}
 .points-box span{font-size:12px;color:#96631a}
 .points-box b{font-size:19px;color:#b9761a;font-variant-numeric:tabular-nums}
+.sync-chip{margin-top:8px;display:flex;align-items:center;gap:7px;padding:7px 9px;border-radius:10px;
+  font-size:11.5px;color:#a98bb4;cursor:pointer;transition:.15s;line-height:1.3}
+.sync-chip:hover{background:#faf0f7}
+.sync-chip .dot{width:7px;height:7px;border-radius:50%;background:#d9c3d3;flex:0 0 7px}
+.sync-chip.on .dot{background:#34c07d}
+.sync-chip.err .dot{background:#e0526e}
+.sync-chip.run .dot{background:#f0a020}
 
 /* ---------- 主区 ---------- */
 .main{flex:1;min-width:0;padding:22px 26px 56px}
@@ -311,6 +318,7 @@ label.fld input:focus,label.fld select:focus,label.fld textarea:focus{border-col
     </nav>
     <div class="side-foot">
       <div class="points-box"><span>当前积分</span><b id="sidePoints">0</b></div>
+      <div class="sync-chip" id="syncChip" data-act="gosync"><i class="dot"></i><span id="syncTxt">未开启同步</span></div>
     </div>
   </aside>
   <main class="main">
@@ -405,12 +413,13 @@ function defaultRewards(){
 
 function seed(){
   return {
-    version: 7,
+    version: 8,
     profile: {name:'佳佳', grade:'八年级上'},
     exam: {name:'期末考试', date:'2027-01-20'},
     tasks: defaultTasks(),
     rewards: defaultRewards(),
-    records: {}, points: 0, log: [], mistakes: []
+    records: {}, points: 0, log: [], mistakes: [],
+    cfgAt: Date.now(), removed: {task:[], reward:[], mis:[]}
   };
 }
 
@@ -459,7 +468,16 @@ function migrate(o){
     if(o.profile && o.profile.name === '李佳佳') o.profile.name = '佳佳';
     migratedNow = true;
   }
-  o.version = 7;
+  if(o.version < 8){
+    /* 为多设备合并做准备：删除记录改成墓碑、配置带时间戳 */
+    o.cfgAt = o.cfgAt || 0;
+    o.removed = o.removed || {task:[], reward:[], mis:[]};
+    o.removed.task = o.removed.task || [];
+    o.removed.reward = o.removed.reward || [];
+    o.removed.mis = o.removed.mis || [];
+    migratedNow = true;
+  }
+  o.version = 8;
   return o;
 }
 
@@ -471,7 +489,7 @@ function load(){
     if(raw){
       const o = JSON.parse(raw);
       if(o && Array.isArray(o.tasks)){
-        if(o.version !== 7) migrate(o);
+        if(o.version !== 8) migrate(o);
         localStorage.setItem(KEY, JSON.stringify(o));
         return o;
       }
@@ -481,17 +499,20 @@ function load(){
   try{ localStorage.setItem(KEY, JSON.stringify(s)); }catch(e){}
   return s;
 }
-function save(){
+function save(skipSync){
   try{ localStorage.setItem(KEY, JSON.stringify(S)); }
   catch(e){ toast('保存失败：浏览器存储不可用'); }
+  if(!skipSync) scheduleSync();
 }
+/* 任务、奖励、奖励说明这些「配置」改动时打时间戳，多设备按时间取新的 */
+function bumpCfg(){ S.cfgAt = Date.now(); }
 
 /* ================= 业务 ================= */
 function tasksFor(k){
   const w = dowOf(parseDk(k));
   return S.tasks.filter(t => t.active !== false && Array.isArray(t.days) && t.days.includes(w));
 }
-function isDone(k, id){ return !!(S.records[k] && S.records[k][id]); }
+function isDone(k, id){ const r = S.records[k] && S.records[k][id]; return !!(r && !r.del); }
 function rateOf(k){
   const ts = tasksFor(k);
   if(!ts.length) return null;
@@ -503,8 +524,9 @@ function toggleTask(id, k){
   if(!t) return;
   if(k > todayKey()){ toast('未来的日子还不能打卡'); return; }
   S.records[k] = S.records[k] || {};
-  if(S.records[k][id]){
-    delete S.records[k][id];
+  if(isDone(k, id)){
+    /* 不真删，留一条取消标记，多设备合并时才不会被另一台「复活」 */
+    S.records[k][id] = {ts:Date.now(), pts:t.points, del:1};
     S.points -= t.points;
     S.log.unshift({ts:Date.now(), delta:-t.points, reason:'取消打卡：' + t.title, date:k});
     toast('已取消 · -' + t.points + ' 分');
@@ -576,6 +598,7 @@ function renderAll(){
     dash: renderDash, plan: renderPlan, habits: renderHabits, tasks: renderTasks,
     cal: renderCal, mistakes: renderMis, rewards: renderRewards, settings: renderSettings
   })[view]();
+  renderSyncChip();
   bindView();
 }
 
@@ -754,7 +777,7 @@ function habitStreak(t){
 }
 function habitTotal(t){
   let n = 0;
-  Object.keys(S.records).forEach(k => { if(S.records[k][t.id]) n++; });
+  Object.keys(S.records).forEach(k => { if(isDone(k, t.id)) n++; });
   return n;
 }
 function habitRate(t, span){
@@ -1033,6 +1056,7 @@ function renderSettings(){
       + '</div>'
       + '<div style="margin-top:12px"><button class="btn primary" data-act="saveset">保存</button></div></div></div>'
     + '<div style="height:16px"></div>'
+    + syncCard()
     + '<div class="card"><div class="card-hd"><h3>数据备份</h3><span class="hint">数据存在本机浏览器里</span></div>'
       + '<div class="card-pad" style="display:flex;gap:10px;flex-wrap:wrap">'
         + '<button class="btn" data-act="export">导出 JSON</button>'
@@ -1110,9 +1134,10 @@ function bindView(){
         try{
           const o = JSON.parse(rd.result);
           if(!o || !Array.isArray(o.tasks)) throw new Error('格式不对');
-          o.version = 2;
+          o.version = 8;
           o.records = o.records || {}; o.log = o.log || []; o.mistakes = o.mistakes || [];
           o.rewards = o.rewards || []; o.points = o.points || 0;
+          o.cfgAt = Date.now(); o.removed = o.removed || {task:[], reward:[], mis:[]};
           S = o; save(); renderAll(); toast('导入成功');
         }catch(err){ toast('导入失败：' + err.message); }
       };
@@ -1152,11 +1177,14 @@ document.addEventListener('click', e => {
     openTaskModal(el.dataset.id);
   } else if(act === 'toggletask'){
     const t = S.tasks.find(x => x.id === el.dataset.id);
-    if(t){ t.active = t.active === false; save(); renderAll(); toast(t.active === false ? '已停用' : '已启用'); }
+    if(t){ t.active = t.active === false; t.upd = Date.now(); bumpCfg(); save(); renderAll();
+      toast(t.active === false ? '已停用' : '已启用'); }
   } else if(act === 'deltask'){
     const t = S.tasks.find(x => x.id === el.dataset.id);
     if(t && confirm('删除任务「' + t.title + '」？已打卡记录会保留。')){
-      S.tasks = S.tasks.filter(x => x.id !== t.id); save(); renderAll(); toast('已删除');
+      S.tasks = S.tasks.filter(x => x.id !== t.id);
+      S.removed.task = uniqArr((S.removed.task || []).concat(t.id));
+      bumpCfg(); save(); renderAll(); toast('已删除');
     }
   } else if(act === 'savetask'){
     const id = el.dataset.id;
@@ -1175,11 +1203,11 @@ document.addEventListener('click', e => {
     };
     if(id){
       const t = S.tasks.find(x => x.id === id);
-      if(t) Object.assign(t, payload);
+      if(t) Object.assign(t, payload, {upd: Date.now()});
     }else{
       S.tasks.push(Object.assign({id:uid(), active:true, createdAt:Date.now()}, payload));
     }
-    save(); closeModal(); renderAll(); toast('已保存');
+    bumpCfg(); save(); closeModal(); renderAll(); toast('已保存');
   } else if(act === 'closemodal'){
     closeModal();
   } else if(act === 'calmove'){
@@ -1200,37 +1228,39 @@ document.addEventListener('click', e => {
     save(); renderAll(); toast('已加入错题本');
   } else if(act === 'review'){
     const m = S.mistakes.find(x => x.id === el.dataset.id);
-    if(m){ m.reviews = (m.reviews || 0) + 1; m.last = todayKey(); save(); renderAll(); toast('复习 +1'); }
+    if(m){ m.reviews = (m.reviews || 0) + 1; m.last = todayKey(); m.upd = Date.now(); save(); renderAll(); toast('复习 +1'); }
   } else if(act === 'master'){
     const m = S.mistakes.find(x => x.id === el.dataset.id);
-    if(m){ m.status = m.status === '已掌握' ? '待复习' : '已掌握'; save(); renderAll(); }
+    if(m){ m.status = m.status === '已掌握' ? '待复习' : '已掌握'; m.upd = Date.now(); save(); renderAll(); }
   } else if(act === 'delmis'){
     const m = S.mistakes.find(x => x.id === el.dataset.id);
     if(m && confirm('删除错题「' + m.title + '」？')){
-      S.mistakes = S.mistakes.filter(x => x.id !== m.id); save(); renderAll();
+      S.mistakes = S.mistakes.filter(x => x.id !== m.id);
+      S.removed.mis = uniqArr((S.removed.mis || []).concat(m.id));
+      save(); renderAll();
     }
   } else if(act === 'redeem'){
     const r = S.rewards.find(x => x.id === el.dataset.id);
     if(!r) return;
     if(S.points < r.cost){ toast('积分不够'); return; }
     if(!confirm('用 ' + r.cost + ' 积分兑换「' + r.title + '」？')) return;
-    S.points -= r.cost; r.redeemed = (r.redeemed || 0) + 1;
+    S.points -= r.cost; r.redeemed = (r.redeemed || 0) + 1; r.upd = Date.now();
     S.log.unshift({ts:Date.now(), delta:-r.cost, reason:'兑换：' + r.title, date:todayKey()});
-    save(); renderAll(); toast('兑换成功，记得兑现哦');
+    bumpCfg(); save(); renderAll(); toast('兑换成功，记得兑现哦');
   } else if(act === 'newreward'){
     openRewardModal();
   } else if(act === 'savereward'){
     const title = ($('#rTitle').value || '').trim();
     const cost = Math.max(1, Number($('#rCost').value) || 100);
     if(!title){ toast('填奖励名称'); return; }
-    S.rewards.push({id:uid(), title, cost, redeemed:0});
-    save(); closeModal(); renderAll(); toast('已添加');
+    S.rewards.push({id:uid(), title, cost, redeemed:0, createdAt:Date.now()});
+    bumpCfg(); save(); closeModal(); renderAll(); toast('已添加');
   } else if(act === 'saveset'){
     S.profile.name = ($('#setName').value || '').trim() || '佳佳';
     S.profile.grade = ($('#setGrade').value || '').trim();
     S.exam.name = ($('#setExamName').value || '').trim() || '期末考试';
     S.exam.date = $('#setExamDate').value || '';
-    save(); renderAll(); toast('已保存');
+    bumpCfg(); save(); renderAll(); toast('已保存');
   } else if(act === 'export'){
     const blob = new Blob([JSON.stringify(S, null, 2)], {type:'application/json'});
     const a = document.createElement('a');
@@ -1247,6 +1277,28 @@ document.addEventListener('click', e => {
         localStorage.removeItem(KEY); S = seed(); save(); renderAll(); toast('已重置为初始数据');
       }
     }
+  } else if(act === 'syncon'){
+    const tk = ($('#syncToken').value || '').trim();
+    if(tk.length < 20){ toast('令牌不像是对的，确认复制完整'); return; }
+    SY.token = tk; SY.gistId = ''; saveSY();
+    sync.at = 0; sync.ok = false; dirty = true;
+    toast('正在连接 GitHub…');
+    syncNow(true).then(() => { if(view === 'settings') renderAll(); });
+  } else if(act === 'syncnow'){
+    syncNow(true);
+  } else if(act === 'syncoff'){
+    if(confirm('断开同步？本机数据保留，云端那份也不会删。')){
+      SY.token = ''; SY.gistId = ''; saveSY(); sync.at = 0; sync.ok = false;
+      renderAll(); toast('已断开同步');
+    }
+  } else if(act === 'synclink'){
+    const link = pairLink();
+    const done = () => toast('链接已复制，发到手机打开就自动连上');
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(link).then(done).catch(() => prompt('复制这个链接发到手机：', link));
+    } else prompt('复制这个链接发到手机：', link);
+  } else if(act === 'gosync'){
+    view = 'settings'; renderAll();
   }
 });
 
@@ -1254,9 +1306,273 @@ document.addEventListener('keydown', e => {
   if(e.key === 'Escape') closeModal();
 });
 
+/* ================= 云端同步：GitHub 私有 Gist =================
+   令牌只存在本机浏览器，不写进页面；数据存在你自己 GitHub 的一个私有 gist 里。
+   合并规则：打卡记录按「日期 + 任务」取时间较新的一条（取消用墓碑标记），
+   积分按记录重算，任务/奖励/错题按 id 合并，配置按 cfgAt 取新的。 */
+const SKEY = 'ljj_sync_v1';
+const GIST_FILE = 'jiajia-checkin.json';
+const GH_API = 'https://api.github.com';
+let SY = (function(){
+  try{
+    const raw = localStorage.getItem(SKEY);
+    if(raw){ const o = JSON.parse(raw); if(o && typeof o === 'object'){ o.device = o.device || uid(); return o; } }
+  }catch(e){}
+  return {token:'', gistId:'', device: uid()};
+})();
+function saveSY(){ try{ localStorage.setItem(SKEY, JSON.stringify(SY)); }catch(e){} }
+
+let sync = {busy:false, ok:false, msg:'', at:0};
+let pushTimer = null, dirty = false;
+
+const uniqArr = a => Array.from(new Set(a));
+const hhmm = ts => { const d = new Date(ts); return pad(d.getHours()) + ':' + pad(d.getMinutes()); };
+function b64utf8(str){
+  const b = new TextEncoder().encode(str); let bin = '';
+  for(let i = 0; i < b.length; i += 0x8000) bin += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+function unb64utf8(s){
+  const bin = atob(s), bytes = new Uint8Array(bin.length);
+  for(let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+
+function syncStatusText(){
+  if(!SY.token) return '未开启同步：数据只存在这台设备';
+  if(sync.busy) return '正在同步…';
+  if(sync.at) return (sync.ok ? '上次同步 ' : '同步失败 ') + hhmm(sync.at) + (sync.msg ? ' · ' + sync.msg : '');
+  return '等待第一次同步…';
+}
+function renderSyncChip(){
+  const chip = $('#syncChip'); if(!chip) return;
+  chip.classList.toggle('on', !!SY.token && sync.ok && !sync.busy);
+  chip.classList.toggle('err', !!SY.token && !sync.busy && sync.at > 0 && !sync.ok);
+  chip.classList.toggle('run', !!SY.token && sync.busy);
+  const t = $('#syncTxt');
+  if(t) t.textContent = !SY.token ? '未开启同步'
+    : (sync.busy ? '同步中…' : (!sync.at ? '等待同步' : (sync.ok ? '已同步 ' + hhmm(sync.at) : '同步失败')));
+  const st = $('#syncState'); if(st) st.textContent = syncStatusText();
+}
+
+function syncCard(){
+  const on = !!SY.token;
+  const body = on
+    ? '<div class="card-pad">'
+      + '<div style="font-size:12.5px;color:#8a6b96;line-height:1.7;margin-bottom:10px">'
+      + '已连接。手机和电脑各自打卡，几秒内合并成同一份记录，哪台设备也不怕清缓存。</div>'
+      + '<div style="font-size:12.5px;background:#faf0f8;border-radius:10px;padding:8px 10px;margin-bottom:10px" id="syncState">'
+      + esc(syncStatusText()) + '</div>'
+      + '<div style="display:flex;gap:10px;flex-wrap:wrap">'
+        + '<button class="btn primary" data-act="syncnow">立即同步</button>'
+        + '<button class="btn" data-act="synclink">手机配对链接</button>'
+        + '<button class="btn danger" data-act="syncoff">断开同步</button>'
+      + '</div></div>'
+    : '<div class="card-pad">'
+      + '<div style="font-size:12.5px;color:#8a6b96;line-height:1.75;margin-bottom:10px">'
+      + '填一次 GitHub 令牌，手机和电脑就共用一份记录。令牌只留在本机浏览器，不会发给别人。<br>'
+      + '获取：GitHub → 头像 → Settings → Developer settings → Personal access tokens → Tokens (classic) → '
+      + 'Generate new token (classic)，<b>只勾 gist</b>，生成后复制那串字符。</div>'
+      + '<label class="fld"><span>GitHub 令牌</span>'
+      + '<input id="syncToken" type="password" placeholder="ghp_ 开头的一长串" autocomplete="off"></label>'
+      + '<div style="margin-top:10px;display:flex;gap:10px;flex-wrap:wrap">'
+        + '<button class="btn primary" data-act="syncon">连接</button>'
+      + '</div>'
+      + '<div style="font-size:11.5px;color:#b79cc2;margin-top:9px">连好之后点「手机配对链接」，把链接发到手机打开，手机就自动配好，不用打字。</div>'
+      + '</div>';
+  return '<div class="card"><div class="card-hd"><h3>云端同步</h3><span class="hint">'
+    + (on ? '已开启' : '未开启') + '</span></div>' + body + '</div>'
+    + '<div style="height:16px"></div>';
+}
+
+function gh(path, opt){
+  opt = opt || {};
+  const h = {'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'};
+  if(SY.token) h['Authorization'] = 'Bearer ' + SY.token;
+  if(opt.body) h['Content-Type'] = 'application/json';
+  return fetch(GH_API + path, {
+    method: opt.method || 'GET', headers: h,
+    body: opt.body ? JSON.stringify(opt.body) : undefined, cache: 'no-store'
+  }).then(r => r.text().then(txt => {
+    let d = null; try{ d = txt ? JSON.parse(txt) : null; }catch(e){}
+    if(!r.ok){ const e = new Error((d && d.message) || ('HTTP ' + r.status)); e.status = r.status; throw e; }
+    return d;
+  }));
+}
+
+function parseGist(g){
+  const f = g && g.files && g.files[GIST_FILE];
+  if(!f || !f.content) return null;
+  try{ const o = JSON.parse(f.content); return (o && o.state && Array.isArray(o.state.tasks)) ? o : null; }catch(e){ return null; }
+}
+async function pullRemote(){
+  if(SY.gistId){
+    try{
+      const st = parseGist(await gh('/gists/' + SY.gistId));
+      if(st) return st;
+      return null;
+    }catch(e){
+      if(e.status !== 404 && e.status !== 401) throw e;
+      if(e.status === 401) throw e;
+      SY.gistId = ''; saveSY();
+    }
+  }
+  const list = await gh('/gists?per_page=100');
+  const hit = (list || []).find(g => g.files && g.files[GIST_FILE]);
+  if(!hit) return null;
+  SY.gistId = hit.id; saveSY();
+  return parseGist(await gh('/gists/' + hit.id));
+}
+async function pushRemote(){
+  const payload = JSON.stringify({app:'jiajia-checkin', v:1, device: SY.device, savedAt: Date.now(), state: S});
+  if(!SY.gistId){
+    const g = await gh('/gists', {method:'POST', body:{
+      description:'佳佳 · 学习打卡台 数据（私有，勿删）', public:false,
+      files:{[GIST_FILE]:{content:payload}}
+    }});
+    SY.gistId = g.id; saveSY();
+  }else{
+    await gh('/gists/' + SY.gistId, {method:'PATCH', body:{files:{[GIST_FILE]:{content:payload}}}});
+  }
+}
+
+function calcPoints(){
+  let p = 0;
+  const rec = S.records || {};
+  Object.keys(rec).forEach(k => Object.keys(rec[k]).forEach(id => {
+    const r = rec[k][id]; if(r && !r.del) p += Number(r.pts) || 0;
+  }));
+  (S.log || []).forEach(x => { if(/^兑换：/.test(x.reason || '')) p += Number(x.delta) || 0; });
+  return Math.max(0, Math.round(p));
+}
+function newerOf(x, y, tkey){
+  const a = x.upd || x[tkey] || 0, b = y.upd || y[tkey] || 0;
+  return b > a ? y : x;
+}
+function mergeById(mine, theirs, removedIds, tkey){
+  const map = new Map();
+  (mine || []).forEach(x => map.set(x.id, x));
+  (theirs || []).forEach(x => {
+    const cur = map.get(x.id);
+    if(!cur){ map.set(x.id, x); return; }
+    const win = newerOf(cur, x, tkey), lose = win === cur ? x : cur;
+    const m = Object.assign({}, win);
+    if(win.redeemed != null || lose.redeemed != null) m.redeemed = Math.max(win.redeemed || 0, lose.redeemed || 0);
+    if(win.reviews != null || lose.reviews != null) m.reviews = Math.max(win.reviews || 0, lose.reviews || 0);
+    if(win.status === '待复习' && lose.status === '已掌握') m.status = '已掌握';
+    map.set(x.id, m);
+  });
+  return Array.from(map.values()).filter(x => removedIds.indexOf(x.id) < 0);
+}
+function mergeInto(r){
+  if(!r || !Array.isArray(r.tasks)) return;
+  const removed = {
+    task: uniqArr(((S.removed && S.removed.task) || []).concat((r.removed && r.removed.task) || [])),
+    reward: uniqArr(((S.removed && S.removed.reward) || []).concat((r.removed && r.removed.reward) || [])),
+    mis: uniqArr(((S.removed && S.removed.mis) || []).concat((r.removed && r.removed.mis) || []))
+  };
+
+  /* 打卡记录 */
+  const rec = {};
+  const days = new Set(Object.keys(S.records || {}).concat(Object.keys(r.records || {})));
+  days.forEach(k => {
+    const a = (S.records || {})[k] || {}, b = (r.records || {})[k] || {};
+    const ids = new Set(Object.keys(a).concat(Object.keys(b)));
+    const one = {};
+    ids.forEach(id => {
+      const x = a[id], y = b[id];
+      const pick = !x ? y : (!y ? x : ((x.ts || 0) >= (y.ts || 0) ? x : y));
+      if(pick) one[id] = pick;   /* 取消标记也要留着，否则对端会把已取消的打卡复活 */
+    });
+    if(Object.keys(one).length) rec[k] = one;
+  });
+  S.records = rec;
+
+  /* 积分流水：合并去重，仅用于展示；积分按记录重算 */
+  const seen = new Set(), log = [];
+  (S.log || []).concat(r.log || []).forEach(x => {
+    const key = (x.ts || 0) + '|' + x.delta + '|' + (x.reason || '');
+    if(seen.has(key)) return;
+    seen.add(key); log.push(x);
+  });
+  log.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  S.log = log.filter(x => /^兑换：/.test(x.reason || ''))
+    .concat(log.filter(x => !/^兑换：/.test(x.reason || '')).slice(0, 200))
+    .sort((a, b) => (b.ts || 0) - (a.ts || 0));
+  S.points = calcPoints();
+
+  /* 任务 / 奖励 / 错题 */
+  S.tasks = mergeById(S.tasks, r.tasks, removed.task, 'createdAt');
+  S.rewards = mergeById(S.rewards, r.rewards, removed.reward, 'createdAt');
+  S.mistakes = mergeById(S.mistakes, r.mistakes, removed.mis, 'createdAt');
+
+  /* 基本信息按修改时间取新的 */
+  if((r.cfgAt || 0) > (S.cfgAt || 0)){
+    S.profile = Object.assign({}, S.profile, r.profile || {});
+    S.exam = Object.assign({}, S.exam, r.exam || {});
+  }
+  S.cfgAt = Math.max(S.cfgAt || 0, r.cfgAt || 0);
+  S.removed = removed;
+  S.version = Math.max(S.version || 0, r.version || 0);
+}
+
+async function syncNow(manual){
+  if(!SY.token){ if(manual) toast('先填入 GitHub 令牌'); return; }
+  if(sync.busy) return;
+  sync.busy = true; sync.msg = ''; renderSyncChip();
+  let changed = false;
+  try{
+    const remote = await pullRemote();
+    if(remote && remote.state){
+      const before = JSON.stringify(S);
+      mergeInto(remote.state);
+      changed = JSON.stringify(S) !== before;
+      if(changed){ save(true); dirty = true; }
+    }
+    if(dirty || !remote){ await pushRemote(); dirty = false; }
+    sync.ok = true;
+    sync.msg = changed ? '已合并另一台设备的更新' : '';
+    if(manual) toast(changed ? '已同步，合并了另一台设备的记录' : '已是最新');
+  }catch(e){
+    sync.ok = false;
+    sync.msg = e.status === 401 ? '令牌无效或已过期'
+      : e.status === 403 ? 'GitHub 限流，稍后再试'
+      : e.status === 404 ? '找不到 gist，请点断开后重连'
+      : (e.message || '网络不通');
+    if(manual) toast('同步失败：' + sync.msg);
+  }finally{
+    sync.busy = false; sync.at = Date.now();
+    renderSyncChip();
+    if(changed) renderAll();
+  }
+}
+function scheduleSync(){
+  if(!SY.token) return;
+  dirty = true;
+  if(pushTimer) clearTimeout(pushTimer);
+  pushTimer = setTimeout(() => { pushTimer = null; syncNow(false); }, 5000);
+}
+function pairLink(){
+  return location.origin + location.pathname + '#sync=' + b64utf8(JSON.stringify({t: SY.token, g: SY.gistId || ''}));
+}
+function applyPairLink(){
+  const m = /#sync=([^&]+)/.exec(location.hash || '');
+  if(!m) return;
+  try{
+    const o = JSON.parse(unb64utf8(m[1]));
+    if(o && o.t){ SY.token = o.t; SY.gistId = o.g || ''; saveSY(); dirty = true;
+      toast('已从配对链接完成设置'); }
+  }catch(e){ console.warn('配对链接解析失败', e); }
+  try{ history.replaceState(null, '', location.pathname + location.search); }catch(e){ location.hash = ''; }
+}
+
 /* 启动 */
+applyPairLink();
 renderAll();
 if(migratedNow) setTimeout(() => toast('数据已按新版规则升级'), 500);
+if(SY.token) setTimeout(() => syncNow(false), 800);
+setInterval(() => { if(SY.token && !document.hidden) syncNow(false); }, 45000);
+document.addEventListener('visibilitychange', () => { if(!document.hidden && SY.token) syncNow(false); });
 </script>
 </body>
 </html>
