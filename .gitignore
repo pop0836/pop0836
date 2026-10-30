@@ -1,0 +1,5 @@
+.workbuddy/
+_chk.js
+_smoke*.js
+.DS_Store
+Thumbs.db
