@@ -419,7 +419,7 @@ function seed(){
     tasks: defaultTasks(),
     rewards: defaultRewards(),
     records: {}, points: 0, log: [], mistakes: [],
-    cfgAt: Date.now(), removed: {task:[], reward:[], mis:[]}
+    cfgAt: Date.now(), removed: {task:[], reward:[], mis:[]}, pristine: true
   };
 }
 
@@ -475,6 +475,7 @@ function migrate(o){
     o.removed.task = o.removed.task || [];
     o.removed.reward = o.removed.reward || [];
     o.removed.mis = o.removed.mis || [];
+    o.pristine = false;   /* 老用户已经在自己那台设备上用了，不能算「全新」 */
     migratedNow = true;
   }
   o.version = 8;
@@ -502,7 +503,7 @@ function load(){
 function save(skipSync){
   try{ localStorage.setItem(KEY, JSON.stringify(S)); }
   catch(e){ toast('保存失败：浏览器存储不可用'); }
-  if(!skipSync) scheduleSync();
+  if(!skipSync){ S.pristine = false; scheduleSync(); }
 }
 /* 任务、奖励、奖励说明这些「配置」改动时打时间戳，多设备按时间取新的 */
 function bumpCfg(){ S.cfgAt = Date.now(); }
@@ -1514,6 +1515,25 @@ function mergeInto(r){
   S.cfgAt = Math.max(S.cfgAt || 0, r.cfgAt || 0);
   S.removed = removed;
   S.version = Math.max(S.version || 0, r.version || 0);
+  dedupeTasks();
+}
+/* 两台设备可能各自带一份默认任务（id 不同、内容一样），合并后去掉重复的，
+   优先保留已经有打卡记录的那一条，否则历史打勾会挂不上任务 */
+function dedupeTasks(){
+  const used = new Set();
+  Object.keys(S.records || {}).forEach(k => Object.keys(S.records[k] || {})
+    .forEach(id => { if(!S.records[k][id].del) used.add(id); }));
+  const byKey = new Map(), out = [];
+  (S.tasks || []).forEach(t => {
+    const key = [t.title, t.subject, t.slot, (t.days || []).join('-'), t.points, t.minutes].join('|');
+    const prev = byKey.get(key);
+    if(!prev){ byKey.set(key, t); out.push(t); return; }
+    if(!used.has(prev.id) && used.has(t.id)){
+      out[out.indexOf(prev)] = t;
+      byKey.set(key, t);
+    }
+  });
+  S.tasks = out;
 }
 
 async function syncNow(manual){
@@ -1524,10 +1544,15 @@ async function syncNow(manual){
   try{
     const remote = await pullRemote();
     if(remote && remote.state){
-      const before = JSON.stringify(S);
-      mergeInto(remote.state);
-      changed = JSON.stringify(S) !== before;
-      if(changed){ save(true); dirty = true; }
+      if(S.pristine){
+        /* 本机还没开始用（全新安装），直接采用云端那份，避免两套默认任务 */
+        S = remote.state; S.pristine = false; changed = true; save(true);
+      }else{
+        const before = JSON.stringify(S);
+        mergeInto(remote.state);
+        changed = JSON.stringify(S) !== before;
+        if(changed){ save(true); dirty = true; }
+      }
     }
     if(dirty || !remote){ await pushRemote(); dirty = false; }
     sync.ok = true;
@@ -1536,7 +1561,7 @@ async function syncNow(manual){
   }catch(e){
     sync.ok = false;
     sync.msg = e.status === 401 ? '令牌无效或已过期'
-      : e.status === 403 ? 'GitHub 限流，稍后再试'
+      : e.status === 403 ? '令牌权限不足（需勾 gist）或已限流'
       : e.status === 404 ? '找不到 gist，请点断开后重连'
       : (e.message || '网络不通');
     if(manual) toast('同步失败：' + sync.msg);
